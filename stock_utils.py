@@ -1,41 +1,57 @@
 """
-stock_utils.py  --  Modules 1, 2 and 3 of the project
-======================================================
+stock_utils.py  --  Modules 1, 2 and 3 of the project (version 2)
+=================================================================
 Module 1 : Data Collection              -> fetch_stock_data, handle_missing_values
 Module 2 : Preprocessing + Features     -> add_indicators, build_feature_table
-Module 3 : Model Building               -> RandomForest (Model A) + LSTM (Model B),
-                                           evaluation, saving, loading, prediction
+Module 3 : Model Building               -> RandomForest, GradientBoosting, LSTM (optional),
+                                           Ensemble, evaluation, saving, prediction
 
+Works for ANY Yahoo Finance symbol (stocks, indices, crypto, commodities, forex, ETFs).
 Educational project only. NOT financial advice.
 """
 
 import os
+import re
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import ta                                   # technical analysis library
-import joblib                               # used to save .pkl files
-from sklearn.ensemble import RandomForestClassifier
+import joblib                               # saves .pkl files
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, confusion_matrix)
 
 # ----------------------------------------------------------------------------
-# SETTINGS (change here, everything else follows)
+# SETTINGS
 # ----------------------------------------------------------------------------
-STOCKS = ["TCS.NS", "RELIANCE.NS", "INFY.NS"]   # NSE tickers end with ".NS"
-MODEL_DIR = "models"                             # folder where models are saved
+STOCKS = ["TCS.NS", "RELIANCE.NS", "INFY.NS"]    # default list used by train_models.py
+MODEL_DIR = "models"
 SEQ_LEN = 60                                     # LSTM looks at the last 60 days
 TRAIN_RATIO = 0.80                               # 80% train, 20% test
 
-# Columns given to the models as input (X). "Target" is the answer (y).
+# Features given to the models. Most are RATIOS, not raw prices.
+# WHY: raw prices keep drifting upward over the years (non-stationary), so a model
+# trained on old price levels does not transfer to new levels. Ratios such as
+# "distance from MA20 in %" mean the same thing in any year. This is one of the
+# main accuracy improvements over version 1.
 FEATURES = [
-    "Close", "Volume", "Return",
-    "MA20", "MA50", "RSI",
-    "MACD", "MACD_signal", "MACD_hist",
-    "BB_high", "BB_low",
-    "Close_lag1", "Close_lag2", "Close_lag5",
+    "Return", "Ret_lag1", "Ret_lag2", "Ret_lag5",     # today's and past daily returns
+    "ROC10",                                          # 10-day rate of change
+    "Vol10",                                          # 10-day volatility
+    "Vol_ratio",                                      # today's volume / 20-day average volume
+    "RSI", "Stoch",                                   # momentum oscillators
+    "MACD_norm", "MACDhist_norm",                     # MACD scaled by price
+    "Dist_MA20", "Dist_MA50", "MA20_vs_MA50",         # trend position
+    "BB_width", "BB_pos",                             # Bollinger Band width and position
+    "ATR_norm",                                       # average true range (volatility)
 ]
+
+
+def safe_name(ticker):
+    """'^NSEI' -> '_NSEI' so the name is safe for file names."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", ticker)
 
 
 # ============================================================================
@@ -44,34 +60,37 @@ FEATURES = [
 def handle_missing_values(df):
     """
     Fill missing values WITHOUT looking into the future.
-
-    VIVA POINT (data leakage): we use forward-fill only (copy yesterday's value
-    to today). We do NOT use back-fill, because back-fill would copy a FUTURE
-    value into the past, which leaks future information into training.
+    VIVA: only forward-fill (copy yesterday to today). Back-fill would copy a
+    FUTURE value into the past = data leakage.
     """
-    df = df.replace([np.inf, -np.inf], np.nan)   # infinity -> missing
-    df = df.ffill()                              # fill gaps with previous day
-    df = df.dropna()                             # drop rows still empty (very first rows)
-    return df
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.ffill()
+    return df.dropna()
 
 
-def fetch_stock_data(ticker, period="2y"):
-    """Download daily OHLCV data of one NSE stock using yfinance."""
-    df = yf.download(ticker, period=period, interval="1d",
-                     auto_adjust=True, progress=False)
+def fetch_stock_data(ticker, period="2y", start=None, end=None):
+    """
+    Download daily OHLCV data of ANY symbol using yfinance.
+    Use either period ("1mo","3mo","6mo","1y","2y","5y","10y","max")
+    or an explicit start/end date.
+    """
+    if start:
+        df = yf.download(ticker, start=start, end=end, interval="1d",
+                         auto_adjust=True, progress=False)
+    else:
+        df = yf.download(ticker, period=period, interval="1d",
+                         auto_adjust=True, progress=False)
 
     if df is None or df.empty:
-        raise ValueError(f"No data received for {ticker}. "
-                         "Check your internet connection or the ticker symbol.")
+        raise ValueError(f"No data received for '{ticker}'. Check the symbol and your internet connection.")
 
-    # Newer yfinance versions return 2-level column names, e.g. ("Close", "TCS.NS").
-    # We keep only the first level so that df["Close"] works normally.
+    # Newer yfinance returns 2-level column names like ("Close", "TCS.NS")
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
     df = df[["Open", "High", "Low", "Close", "Volume"]]
-    df.index = pd.to_datetime(df.index).tz_localize(None)   # remove time zone
-    df = df[~df.index.duplicated(keep="first")].sort_index()  # no duplicate dates
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df[~df.index.duplicated(keep="first")].sort_index()
     return handle_missing_values(df)
 
 
@@ -80,80 +99,70 @@ def fetch_stock_data(ticker, period="2y"):
 # ============================================================================
 def add_indicators(df):
     """
-    Add technical indicators using the `ta` library.
-    Every indicator below uses only PAST and PRESENT prices (rolling windows
-    look backwards), so there is no future information in them.
+    Add technical indicators with the `ta` library. All use only PAST and
+    PRESENT data (rolling windows look backwards) -> no leakage.
     """
     df = df.copy()
-    close = df["Close"]
+    close, high, low = df["Close"], df["High"], df["Low"]
 
-    # Daily percentage change
+    # --- Price based (also used for charts) ---
     df["Return"] = close.pct_change()
-
-    # Moving averages: average closing price of the last 20 / 50 days
     df["MA20"] = ta.trend.SMAIndicator(close, window=20).sma_indicator()
     df["MA50"] = ta.trend.SMAIndicator(close, window=50).sma_indicator()
-
-    # RSI(14): momentum between 0 and 100 (>70 overbought, <30 oversold)
     df["RSI"] = ta.momentum.RSIIndicator(close, window=14).rsi()
 
-    # MACD: difference of 12-day and 26-day exponential averages
     macd = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
     df["MACD"] = macd.macd()
     df["MACD_signal"] = macd.macd_signal()
     df["MACD_hist"] = macd.macd_diff()
 
-    # Bollinger Bands: 20-day average +/- 2 standard deviations
     bb = ta.volatility.BollingerBands(close, window=20, window_dev=2)
     df["BB_high"] = bb.bollinger_hband()
     df["BB_low"] = bb.bollinger_lband()
 
-    # Lag features: the closing price 1, 2 and 5 days ago
-    df["Close_lag1"] = close.shift(1)
-    df["Close_lag2"] = close.shift(2)
-    df["Close_lag5"] = close.shift(5)
+    # --- Extra features used by the models ---
+    df["Ret_lag1"] = df["Return"].shift(1)          # return 1 day ago
+    df["Ret_lag2"] = df["Return"].shift(2)
+    df["Ret_lag5"] = df["Return"].shift(5)
+    df["ROC10"] = ta.momentum.ROCIndicator(close, window=10).roc()
+    df["Vol10"] = df["Return"].rolling(10).std()
+    vol_ratio = df["Volume"] / df["Volume"].rolling(20).mean()
+    df["Vol_ratio"] = vol_ratio.replace([np.inf, -np.inf], np.nan).fillna(1.0)   # indices/forex may have 0 volume
+    df["Stoch"] = ta.momentum.StochasticOscillator(high, low, close, window=14, smooth_window=3).stoch()
+    df["MACD_norm"] = df["MACD"] / close
+    df["MACDhist_norm"] = df["MACD_hist"] / close
+    df["Dist_MA20"] = close / df["MA20"] - 1
+    df["Dist_MA50"] = close / df["MA50"] - 1
+    df["MA20_vs_MA50"] = df["MA20"] / df["MA50"] - 1
+    band = (df["BB_high"] - df["BB_low"]).replace(0, np.nan)
+    df["BB_width"] = band / df["MA20"]
+    df["BB_pos"] = (close - df["BB_low"]) / band
+    df["ATR_norm"] = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range() / close
     return df
 
 
 def build_feature_table(df):
     """
-    Indicators + Target, with rows that have missing indicator values removed.
-
-    Target (what we want to predict):
-        Trend = 1 if Close(t+1) > Close(t) else 0
-        i.e. 1 = tomorrow's close is higher than today's (UP), 0 = DOWN.
-
-    The LAST row has no tomorrow yet, so its Target is NaN. We keep that row
-    because it is the one we use to predict tomorrow in the web app.
+    Indicators + Target. Target: Trend = 1 if Close(t+1) > Close(t) else 0.
+    The LAST row has no tomorrow, so its Target is NaN (kept only for prediction).
     """
     df = add_indicators(df)
     df["Target"] = np.where(df["Close"].shift(-1) > df["Close"], 1.0, 0.0)
-    df.iloc[-1, df.columns.get_loc("Target")] = np.nan      # tomorrow unknown
-    df = df.dropna(subset=FEATURES)                          # first ~50 rows have no MA50
-    return df
+    df.iloc[-1, df.columns.get_loc("Target")] = np.nan
+    return df.dropna(subset=FEATURES)
 
 
 def time_split_index(n_rows, ratio=TRAIN_RATIO):
     """
-    Chronological split point. Rows [0:split] = train (older days),
-    rows [split:] = test (newer days). NO SHUFFLING.
-
-    VIVA POINT (data leakage): if we shuffled, a model could train on
-    Friday's data and be tested on Thursday's data, i.e. it would "see the
-    future". In real life we only know the past, so the test set must be the
-    most recent part of the timeline.
+    Chronological split: rows [0:split] = train (older), rows [split:] = test (newer).
+    NO SHUFFLING. VIVA: shuffling would let the model train on days AFTER the
+    test days, i.e. see the future (data leakage).
     """
     return int(n_rows * ratio)
 
 
 def make_sequences(scaled_X, y, seq_len=SEQ_LEN):
-    """
-    Convert a 2-D table into 3-D windows for the LSTM.
-    Window t = rows [t-59 ... t] (60 days) and the label is y[t].
-    Shape of result: (samples, 60 days, number of features).
-    Also returns end_idx = the row number where each window ends, which helps
-    us split windows into train/test later without leakage.
-    """
+    """Turn a 2-D table into 60-day windows for the LSTM: (samples, 60, features)."""
     X_seq, y_seq, end_idx = [], [], []
     for t in range(seq_len - 1, len(scaled_X)):
         X_seq.append(scaled_X[t - seq_len + 1: t + 1])
@@ -167,52 +176,40 @@ def make_sequences(scaled_X, y, seq_len=SEQ_LEN):
 # ============================================================================
 def build_random_forest():
     """
-    MODEL A - RandomForestClassifier (BASELINE)
-
-    VIVA: Why RandomForest as the baseline?
-      1. Easy to explain: it is many decision trees voting together.
-      2. Hard to overfit compared to one tree, and works well on small data
-         (we only have ~500 rows).
-      3. Needs no feature scaling and gives feature_importances_, so we can
-         say WHICH indicator mattered. This supports "explainable" trends.
-      4. A good baseline: if a complex LSTM cannot beat it, the LSTM is not
-         worth the extra complexity.
-    max_depth and min_samples_leaf are kept small on purpose to reduce overfitting.
+    MODEL A - RandomForest (BASELINE)
+    VIVA: easy to explain (many trees voting), hard to overfit, works on small
+    data, needs no scaling, gives feature importance (explainability). If a more
+    complex model cannot beat it, the complexity is not worth it.
+    Small depth + min_samples_leaf reduce overfitting.
     """
-    return RandomForestClassifier(n_estimators=200, max_depth=6,
-                                  min_samples_leaf=5, random_state=42)
+    return RandomForestClassifier(n_estimators=300, max_depth=6, min_samples_leaf=8,
+                                  random_state=42, n_jobs=-1)
+
+
+def build_gradient_boosting():
+    """
+    MODEL B - Gradient Boosting (HistGradientBoostingClassifier)
+    Trees are built one after another; each new tree fixes the mistakes of the
+    previous ones. Shallow trees + small learning rate + L2 regularisation keep it
+    from memorising noise.
+    """
+    return HistGradientBoostingClassifier(max_depth=3, learning_rate=0.05, max_iter=150,
+                                          l2_regularization=1.0, random_state=42)
 
 
 def build_lstm(n_features, seq_len=SEQ_LEN):
     """
-    MODEL B - LSTM (Long Short-Term Memory)
-
-    VIVA: Why LSTM for time series?
-      Stock data is a SEQUENCE: today's movement depends on the order of the
-      previous days. A RandomForest sees one row at a time and has no memory.
-      An LSTM reads 60 days in order and keeps a memory (cell state).
-
-    VIVA: Explain the 3 gates of an LSTM cell
-      * Forget gate : looks at yesterday's output + today's input and decides
-                      what part of the old memory to ERASE.
-      * Input gate  : decides what NEW information from today to STORE.
-      * Output gate : decides what part of the memory to SEND OUT as today's
-                      output (hidden state).
-      Memory update : new memory = (old memory x forget) + (new info x input).
-      Because memory is mostly "added", gradients do not vanish easily; this is
-      why LSTM beats a simple RNN on long sequences.
-
-    Architecture (as per project requirement):
-      Input (60 days x features) -> LSTM(50) -> Dropout(0.2)
-                                 -> LSTM(50) -> Dropout(0.2) -> Dense(1, sigmoid)
-      * return_sequences=True on the 1st LSTM passes all 60 outputs to the 2nd.
-      * Dropout(0.2) randomly switches off 20% neurons while training
-        -> reduces overfitting.
-      * Dense(1) + sigmoid gives a probability between 0 and 1 (1 = UP).
-      * Adam optimizer + binary_crossentropy loss, because it is a 2-class problem.
+    MODEL C - LSTM (optional, needs TensorFlow)
+    VIVA: stock data is a SEQUENCE. A RandomForest sees one row at a time; an LSTM
+    reads 60 days in order and keeps a memory (cell state).
+    Gates:  forget gate = what old memory to erase,
+            input gate  = what new information to store,
+            output gate = what part of memory to send out.
+    New memory = old memory x forget + new info x input (mostly additive, so the
+    gradient does not vanish like in a simple RNN).
+    Architecture: Input(60 x features) -> LSTM(50) -> Dropout(0.2)
+                  -> LSTM(50) -> Dropout(0.2) -> Dense(1, sigmoid), Adam optimizer.
     """
-    # TensorFlow is imported here (not at the top) so that the rest of the
-    # project still works even if TensorFlow is not installed.
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import Input, LSTM, Dropout, Dense
 
@@ -229,7 +226,7 @@ def build_lstm(n_features, seq_len=SEQ_LEN):
 
 
 def evaluate(y_true, y_pred):
-    """Return (metrics dictionary, confusion matrix as a list)."""
+    """Return (metrics dictionary, confusion matrix as list)."""
     metrics = {
         "Accuracy": accuracy_score(y_true, y_pred),
         "Precision": precision_score(y_true, y_pred, zero_division=0),
@@ -237,21 +234,27 @@ def evaluate(y_true, y_pred):
         "F1-Score": f1_score(y_true, y_pred, zero_division=0),
     }
     metrics = {k: round(float(v), 4) for k, v in metrics.items()}
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist()
-    return metrics, cm
+    return metrics, confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist()
 
 
-def train_lstm(X, y, split, scaler, epochs=50):
+def walk_forward_accuracy(build_fn, X, y, n_splits=5):
     """
-    Train the LSTM and return (model, predictions, probabilities, y_test).
+    Walk-forward validation: train on the past, test on the next block, repeat.
+    Gives 5 accuracy numbers instead of 1, so we can see how stable the model is.
+    """
+    scores = []
+    for tr, te in TimeSeriesSplit(n_splits=n_splits).split(X):
+        m = build_fn()
+        m.fit(X[tr], y[tr])
+        scores.append(float(accuracy_score(y[te], m.predict(X[te]))))
+    return scores
 
-    DATA LEAKAGE CARE:
-      * `scaler` was fitted on the TRAIN rows only (done by the caller).
-      * A window belongs to TRAIN if it ENDS before `split`, otherwise to TEST.
-        A test window may contain older days from the training period as
-        context; that is fine because those days are in the past.
-      * validation_split takes the LAST 10% of training windows (still in time
-        order) and shuffle=False keeps the time order.
+
+def train_lstm(X, y, split, scaler, epochs=40):
+    """
+    Train the LSTM. Returns (model, predictions, probabilities, y_test).
+    Leakage care: scaler fitted on train rows only; a window is TRAIN if it ENDS
+    before `split`; validation_split takes the LAST 10% (time order kept).
     """
     import tensorflow as tf
     from tensorflow.keras.callbacks import EarlyStopping
@@ -261,31 +264,23 @@ def train_lstm(X, y, split, scaler, epochs=50):
     scaled = scaler.transform(X)
     X_seq, y_seq, end_idx = make_sequences(scaled, y)
     is_train = end_idx < split
-    X_tr, y_tr = X_seq[is_train], y_seq[is_train]
-    X_te, y_te = X_seq[~is_train], y_seq[~is_train]
-
     model = build_lstm(X.shape[1])
-    stop_early = EarlyStopping(monitor="val_loss", patience=8,
-                               restore_best_weights=True)
-    model.fit(X_tr, y_tr, epochs=epochs, batch_size=16,
-              validation_split=0.1, shuffle=False,
-              callbacks=[stop_early], verbose=0)
-
-    probs = model.predict(X_te, verbose=0).ravel()
-    pred = (probs >= 0.5).astype(int)
-    return model, pred, probs, y_te
+    stop_early = EarlyStopping(monitor="val_loss", patience=6, restore_best_weights=True)
+    model.fit(X_seq[is_train], y_seq[is_train], epochs=epochs, batch_size=32,
+              validation_split=0.1, shuffle=False, callbacks=[stop_early], verbose=0)
+    probs = model.predict(X_seq[~is_train], verbose=0).ravel()
+    return model, (probs >= 0.5).astype(int), probs, y_seq[~is_train]
 
 
 # ----------------------------------------------------------------------------
-# Saving / loading helpers
+# Saving / loading
 # ----------------------------------------------------------------------------
 def _path(ticker, name):
-    return os.path.join(MODEL_DIR, f"{ticker}_{name}")
+    return os.path.join(MODEL_DIR, f"{safe_name(ticker)}_{name}")
 
 
 def models_exist(ticker):
-    """True if at least the RandomForest model and scaler are saved."""
-    return os.path.exists(_path(ticker, "rf.pkl")) and os.path.exists(_path(ticker, "scaler.pkl"))
+    return all(os.path.exists(_path(ticker, n)) for n in ("rf.pkl", "gb.pkl", "scaler.pkl", "results.pkl"))
 
 
 def lstm_exists(ticker):
@@ -293,110 +288,146 @@ def lstm_exists(ticker):
 
 
 def load_results(ticker):
-    """Load the saved evaluation results (metrics, confusion matrices ...)."""
     p = _path(ticker, "results.pkl")
     return joblib.load(p) if os.path.exists(p) else None
 
 
-def train_and_save(ticker, period="2y", epochs=50):
+def trained_tickers():
+    """Symbols that already have saved results (used by the Model Performance page)."""
+    if not os.path.isdir(MODEL_DIR):
+        return []
+    out = []
+    for f in sorted(os.listdir(MODEL_DIR)):
+        if f.endswith("_results.pkl"):
+            try:
+                out.append(joblib.load(os.path.join(MODEL_DIR, f))["ticker"])
+            except Exception:
+                pass
+    return out
+
+
+def train_and_save(ticker, period="5y", epochs=40, use_lstm=True):
     """
-    Run the WHOLE pipeline for one stock:
-    fetch -> features -> split -> train RF -> train LSTM -> evaluate -> save.
-    Saves  models/<ticker>_rf.pkl, _scaler.pkl, _lstm.h5, _results.pkl
+    Whole pipeline for one symbol:
+    fetch -> features -> time split -> train RF, GB (+LSTM) -> ensemble ->
+    evaluate (test set + walk-forward) -> save.
+    More history (period="10y" or "max") usually gives the models more to learn from.
     """
     os.makedirs(MODEL_DIR, exist_ok=True)
-
-    # Steps 1-2: data + features
     raw = fetch_stock_data(ticker, period)
-    table = build_feature_table(raw)
-    data = table.dropna(subset=["Target"])          # drop last row (tomorrow unknown)
+    data = build_feature_table(raw).dropna(subset=["Target"])
     X = data[FEATURES].values
     y = data["Target"].values.astype(int)
 
-    # Step 3: time-based split (no shuffle)
     split = time_split_index(len(data))
-    if split < SEQ_LEN + 30:
-        raise ValueError("Not enough data to train. Use a longer period (e.g. 2y).")
+    if split < SEQ_LEN + 30 or len(data) < 250:
+        raise ValueError("Not enough history to train (need roughly 1 year or more of daily data). "
+                         "Choose a longer period or a symbol with more history.")
     y_test = y[split:]
-    test_dates = [d.strftime("%Y-%m-%d") for d in data.index[split:]]
+    probs = {}                                   # test-set P(UP) of every model
+    models_out = {}
 
-    # Step 4a: Model A - RandomForest
-    rf = build_random_forest()
-    rf.fit(X[:split], y[:split])
-    rf_pred = rf.predict(X[split:])
-    rf_metrics, rf_cm = evaluate(y_test, rf_pred)
+    # --- Model A: RandomForest ---
+    rf = build_random_forest().fit(X[:split], y[:split])
+    probs["rf"] = rf.predict_proba(X[split:])[:, list(rf.classes_).index(1)]
     joblib.dump(rf, _path(ticker, "rf.pkl"))
     importance = dict(zip(FEATURES, rf.feature_importances_.round(4).tolist()))
 
-    # Scaler is fitted on TRAIN rows only (prevents leakage), used by the LSTM
+    # --- Model B: Gradient Boosting ---
+    gb = build_gradient_boosting().fit(X[:split], y[:split])
+    probs["gb"] = gb.predict_proba(X[split:])[:, list(gb.classes_).index(1)]
+    joblib.dump(gb, _path(ticker, "gb.pkl"))
+
+    # --- Scaler (train rows only) for the LSTM ---
     scaler = StandardScaler().fit(X[:split])
     joblib.dump(scaler, _path(ticker, "scaler.pkl"))
 
-    # Step 4b: Model B - LSTM (skipped politely if TensorFlow is missing)
-    lstm_res = None
-    try:
-        model, lstm_pred, _, y_te = train_lstm(X, y, split, scaler, epochs)
-        assert np.array_equal(y_te, y_test), "RF and LSTM test sets must match"
-        model.save(_path(ticker, "lstm.h5"))
-        m, cm = evaluate(y_test, lstm_pred)
-        lstm_res = {"pred": lstm_pred.tolist(), "metrics": m, "cm": cm}
-    except ImportError:
-        print("TensorFlow not installed -> LSTM skipped (RandomForest still works).")
+    # --- Model C: LSTM (optional) ---
+    if use_lstm:
+        try:
+            model, _, lstm_probs, y_te = train_lstm(X, y, split, scaler, epochs)
+            assert np.array_equal(y_te, y_test)
+            model.save(_path(ticker, "lstm.h5"))
+            probs["lstm"] = lstm_probs
+        except ImportError:
+            print("TensorFlow not installed -> LSTM skipped.")
 
-    # Step 5: evaluation results saved for the web app
+    # --- Ensemble: average probability of all models ---
+    probs["ensemble"] = np.mean([probs[k] for k in probs], axis=0)
+
+    for key, p in probs.items():
+        pred = (p >= 0.5).astype(int)
+        m, cm = evaluate(y_test, pred)
+        models_out[key] = {"pred": pred.tolist(), "prob": [round(float(v), 4) for v in p],
+                           "metrics": m, "cm": cm}
+
+    # --- Honest checks ---
+    majority = max(y_test.mean(), 1 - y_test.mean())          # accuracy of "always guess the commoner class"
+    wf = {"RandomForest": walk_forward_accuracy(build_random_forest, X, y),
+          "GradientBoosting": walk_forward_accuracy(build_gradient_boosting, X, y)}
+
     results = {
-        "ticker": ticker,
-        "n_train": int(split),
-        "n_test": int(len(y_test)),
-        "dates": test_dates,
+        "ticker": ticker, "period": period,
+        "n_train": int(split), "n_test": int(len(y_test)),
+        "start_date": data.index[0].strftime("%Y-%m-%d"),
+        "end_date": data.index[-1].strftime("%Y-%m-%d"),
+        "dates": [d.strftime("%Y-%m-%d") for d in data.index[split:]],
         "y_test": y_test.tolist(),
-        "rf": {"pred": rf_pred.tolist(), "metrics": rf_metrics, "cm": rf_cm},
-        "lstm": lstm_res,
+        "baseline_accuracy": round(float(majority), 4),
+        "walk_forward": wf,
         "importance": importance,
+        "models": models_out,
+        # keys kept for the notebook / older code
+        "rf": models_out["rf"], "lstm": models_out.get("lstm"),
     }
     joblib.dump(results, _path(ticker, "results.pkl"))
     return results
 
 
 # ----------------------------------------------------------------------------
-# Prediction for tomorrow
+# Prediction for tomorrow (next trading day)
 # ----------------------------------------------------------------------------
 def to_trend(prob_up):
-    """Probability of UP -> ("UP"/"DOWN", confidence in %)."""
+    """P(UP) -> ("UP"/"DOWN", confidence %)."""
     if prob_up >= 0.5:
         return "UP", int(round(prob_up * 100))
     return "DOWN", int(round((1 - prob_up) * 100))
 
 
+def confidence_label(conf):
+    """Plain-words reading of the confidence number (honesty for beginners)."""
+    if conf < 55:
+        return "Very low conviction - almost a coin flip"
+    if conf < 60:
+        return "Low conviction"
+    if conf < 70:
+        return "Moderate conviction"
+    return "Higher conviction (still not a guarantee)"
+
+
 def predict_tomorrow(ticker):
-    """
-    Use saved models + the latest market data to predict tomorrow's trend.
-    Returns a dictionary with last date, last close and P(UP) of each model.
-    """
-    raw = fetch_stock_data(ticker, "1y")           # 1 year is enough for MA50 + 60 days
-    table = build_feature_table(raw)
-    latest_X = table[FEATURES].values              # all rows with valid features
+    """Load saved models + latest data and return P(UP) from each model."""
+    table = build_feature_table(fetch_stock_data(ticker, "2y"))
+    X_all = table[FEATURES].values
 
-    # RandomForest uses only the latest day (one row)
     rf = joblib.load(_path(ticker, "rf.pkl"))
-    up_col = list(rf.classes_).index(1)
-    rf_prob = float(rf.predict_proba(latest_X[-1:])[0][up_col])
-
-    # LSTM uses the latest 60 days (scaled with the TRAIN scaler)
-    lstm_prob = None
+    gb = joblib.load(_path(ticker, "gb.pkl"))
+    out = {
+        "last_date": table.index[-1].strftime("%d %b %Y"),
+        "last_close": float(table["Close"].iloc[-1]),
+        "rf_prob_up": float(rf.predict_proba(X_all[-1:])[0][list(rf.classes_).index(1)]),
+        "gb_prob_up": float(gb.predict_proba(X_all[-1:])[0][list(gb.classes_).index(1)]),
+        "lstm_prob_up": None,
+    }
     if lstm_exists(ticker):
         try:
             from tensorflow.keras.models import load_model
             scaler = joblib.load(_path(ticker, "scaler.pkl"))
-            window = scaler.transform(latest_X[-SEQ_LEN:])[np.newaxis, :, :]
+            window = scaler.transform(X_all[-SEQ_LEN:])[np.newaxis, :, :]
             lstm = load_model(_path(ticker, "lstm.h5"), compile=False)
-            lstm_prob = float(lstm.predict(window, verbose=0)[0][0])
+            out["lstm_prob_up"] = float(lstm.predict(window, verbose=0)[0][0])
         except ImportError:
-            lstm_prob = None
-
-    return {
-        "last_date": table.index[-1].strftime("%d %b %Y"),
-        "last_close": float(table["Close"].iloc[-1]),
-        "rf_prob_up": rf_prob,
-        "lstm_prob_up": lstm_prob,
-    }
+            pass
+    parts = [out["rf_prob_up"], out["gb_prob_up"]] + ([out["lstm_prob_up"]] if out["lstm_prob_up"] is not None else [])
+    out["ens_prob_up"] = float(np.mean(parts))
+    return out
